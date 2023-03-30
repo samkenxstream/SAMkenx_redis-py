@@ -166,6 +166,11 @@ def test_arrindex(client):
     client.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
     assert 1 == client.json().arrindex("arr", Path.root_path(), 1)
     assert -1 == client.json().arrindex("arr", Path.root_path(), 1, 2)
+    assert 4 == client.json().arrindex("arr", Path.root_path(), 4)
+    assert 4 == client.json().arrindex("arr", Path.root_path(), 4, start=0)
+    assert 4 == client.json().arrindex("arr", Path.root_path(), 4, start=0, stop=5000)
+    assert -1 == client.json().arrindex("arr", Path.root_path(), 4, start=0, stop=-1)
+    assert -1 == client.json().arrindex("arr", Path.root_path(), 4, start=1, stop=3)
 
 
 @pytest.mark.redismod
@@ -824,7 +829,7 @@ def test_objlen_dollar(client):
         },
     )
     # Test multi
-    assert client.json().objlen("doc1", "$..a") == [2, None, 1]
+    assert client.json().objlen("doc1", "$..a") == [None, 2, 1]
     # Test single
     assert client.json().objlen("doc1", "$.nested1.a") == [2]
 
@@ -1326,17 +1331,10 @@ def test_arrindex_dollar(client):
         [],
     ]
 
-    # Fail with none-scalar value
-    with pytest.raises(exceptions.ResponseError):
-        client.json().arrindex("test_None", "$..nested42_empty_arr.arr", {"arr": []})
-
-    # Do not fail with none-scalar value in legacy mode
-    assert (
-        client.json().arrindex(
-            "test_None", ".[4][1].nested42_empty_arr.arr", '{"arr":[]}'
-        )
-        == -1
-    )
+    # Test with none-scalar value
+    assert client.json().arrindex(
+        "test_None", "$..nested42_empty_arr.arr", {"arr": []}
+    ) == [-1]
 
     # Test legacy (path begins with dot)
     # Test index of int scalar in single value
@@ -1411,7 +1409,8 @@ def test_set_path(client):
 
     with open(jsonfile, "w+") as fp:
         fp.write(json.dumps({"hello": "world"}))
-    open(nojsonfile, "a+").write("hello")
+    with open(nojsonfile, "a+") as fp:
+        fp.write("hello")
 
     result = {jsonfile: True, nojsonfile: False}
     assert client.json().set_path(Path.root_path(), root) == result

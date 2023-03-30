@@ -46,6 +46,7 @@ from redis.commands import (
     list_or_args,
 )
 from redis.compat import Protocol, TypedDict
+from redis.credentials import CredentialProvider
 from redis.exceptions import (
     ConnectionError,
     ExecAbortError,
@@ -106,7 +107,7 @@ class Redis(
 
             redis://[[username]:[password]]@localhost:6379/0
             rediss://[[username]:[password]]@localhost:6379/0
-            unix://[[username]:[password]]@/path/to/socket.sock?db=0
+            unix://[username@]/path/to/socket.sock?db=0[&password=password]
 
         Three URL schemes are supported:
 
@@ -174,6 +175,7 @@ class Redis(
         retry: Optional[Retry] = None,
         auto_close_connection_pool: bool = True,
         redis_connect_func=None,
+        credential_provider: Optional[CredentialProvider] = None,
     ):
         """
         Initialize a new Redis client.
@@ -199,6 +201,7 @@ class Redis(
                 "db": db,
                 "username": username,
                 "password": password,
+                "credential_provider": credential_provider,
                 "socket_timeout": socket_timeout,
                 "encoding": encoding,
                 "encoding_errors": encoding_errors,
@@ -250,6 +253,11 @@ class Redis(
 
         self.response_callbacks = CaseInsensitiveDict(self.__class__.RESPONSE_CALLBACKS)
 
+        # If using a single connection client, we need to lock creation-of and use-of
+        # the client in order to avoid race conditions such as using asyncio.gather
+        # on a set of redis commands
+        self._single_conn_lock = asyncio.Lock()
+
     def __repr__(self):
         return f"{self.__class__.__name__}<{self.connection_pool!r}>"
 
@@ -257,8 +265,10 @@ class Redis(
         return self.initialize().__await__()
 
     async def initialize(self: _RedisT) -> _RedisT:
-        if self.single_connection_client and self.connection is None:
-            self.connection = await self.connection_pool.get_connection("_")
+        if self.single_connection_client:
+            async with self._single_conn_lock:
+                if self.connection is None:
+                    self.connection = await self.connection_pool.get_connection("_")
         return self
 
     def set_response_callback(self, command: str, callback: ResponseCallbackT):
@@ -272,6 +282,13 @@ class Redis(
     def get_connection_kwargs(self):
         """Get the connection's key-word arguments"""
         return self.connection_pool.connection_kwargs
+
+    def get_retry(self) -> Optional["Retry"]:
+        return self.get_connection_kwargs().get("retry")
+
+    def set_retry(self, retry: "Retry") -> None:
+        self.get_connection_kwargs().update({"retry": retry})
+        self.connection_pool.set_retry(retry)
 
     def load_external_module(self, funcname, func):
         """
@@ -344,6 +361,7 @@ class Redis(
         name: KeyT,
         timeout: Optional[float] = None,
         sleep: float = 0.1,
+        blocking: bool = True,
         blocking_timeout: Optional[float] = None,
         lock_class: Optional[Type[Lock]] = None,
         thread_local: bool = True,
@@ -358,6 +376,12 @@ class Redis(
         ``sleep`` indicates the amount of time to sleep per loop iteration
         when the lock is in blocking mode and another client is currently
         holding the lock.
+
+        ``blocking`` indicates whether calling ``acquire`` should block until
+        the lock has been acquired or to fail immediately, causing ``acquire``
+        to return False and the lock not being acquired. Defaults to True.
+        Note this value can be overridden by passing a ``blocking``
+        argument to ``acquire``.
 
         ``blocking_timeout`` indicates the maximum amount of time in seconds to
         spend trying to acquire the lock. A value of ``None`` indicates
@@ -401,6 +425,7 @@ class Redis(
             name,
             timeout=timeout,
             sleep=sleep,
+            blocking=blocking,
             blocking_timeout=blocking_timeout,
             thread_local=thread_local,
         )
@@ -435,7 +460,7 @@ class Redis(
                 f"Unclosed client session {self!r}", ResourceWarning, source=self
             )
             context = {"client": self, "message": self._DEL_MESSAGE}
-            asyncio.get_event_loop().call_exception_handler(context)
+            asyncio.get_running_loop().call_exception_handler(context)
 
     async def close(self, close_connection_pool: Optional[bool] = None) -> None:
         """
@@ -465,8 +490,8 @@ class Redis(
     async def _disconnect_raise(self, conn: Connection, error: Exception):
         """
         Close the connection and raise an exception
-        if retry_on_timeout is not set or the error
-        is not a TimeoutError
+        if retry_on_error is not set or the error
+        is not one of the specified error types
         """
         await conn.disconnect()
         if (
@@ -474,6 +499,23 @@ class Redis(
             or isinstance(error, tuple(conn.retry_on_error)) is False
         ):
             raise error
+
+    async def _try_send_command_parse_response(self, conn, *args, **options):
+        try:
+            return await conn.retry.call_with_retry(
+                lambda: self._send_command_parse_response(
+                    conn, args[0], *args, **options
+                ),
+                lambda error: self._disconnect_raise(conn, error),
+            )
+        except asyncio.CancelledError:
+            await conn.disconnect(nowait=True)
+            raise
+        finally:
+            if self.single_connection_client:
+                self._single_conn_lock.release()
+            if not self.connection:
+                await self.connection_pool.release(conn)
 
     # COMMAND EXECUTION AND PROTOCOL PARSING
     async def execute_command(self, *args, **options):
@@ -483,16 +525,12 @@ class Redis(
         command_name = args[0]
         conn = self.connection or await pool.get_connection(command_name, **options)
 
-        try:
-            return await conn.retry.call_with_retry(
-                lambda: self._send_command_parse_response(
-                    conn, command_name, *args, **options
-                ),
-                lambda error: self._disconnect_raise(conn, error),
-            )
-        finally:
-            if not self.connection:
-                await pool.release(conn)
+        if self.single_connection_client:
+            await self._single_conn_lock.acquire()
+
+        return await asyncio.shield(
+            self._try_send_command_parse_response(conn, *args, **options)
+        )
 
     async def parse_response(
         self, connection: Connection, command_name: Union[str, bytes], **options
@@ -501,12 +539,17 @@ class Redis(
         try:
             if NEVER_DECODE in options:
                 response = await connection.read_response(disable_decoding=True)
+                options.pop(NEVER_DECODE)
             else:
                 response = await connection.read_response()
         except ResponseError:
             if EMPTY_RESPONSE in options:
                 return options[EMPTY_RESPONSE]
             raise
+
+        if EMPTY_RESPONSE in options:
+            options.pop(EMPTY_RESPONSE)
+
         if command_name in self.response_callbacks:
             # Mypy bug: https://github.com/python/mypy/issues/10977
             command_name = cast(str, command_name)
@@ -668,6 +711,11 @@ class PubSub:
             self.pending_unsubscribe_patterns = set()
 
     def close(self) -> Awaitable[NoReturn]:
+        # In case a connection property does not yet exist
+        # (due to a crash earlier in the Redis() constructor), return
+        # immediately as there is nothing to clean-up.
+        if not hasattr(self, "connection"):
+            return
         return self.reset()
 
     async def on_connect(self, connection: Connection):
@@ -726,9 +774,17 @@ class PubSub:
         is not a TimeoutError. Otherwise, try to reconnect
         """
         await conn.disconnect()
+
         if not (conn.retry_on_timeout and isinstance(error, TimeoutError)):
             raise error
         await conn.connect()
+
+    async def _try_execute(self, conn, command, *arg, **kwargs):
+        try:
+            return await command(*arg, **kwargs)
+        except asyncio.CancelledError:
+            await conn.disconnect()
+            raise
 
     async def _execute(self, conn, command, *args, **kwargs):
         """
@@ -738,9 +794,11 @@ class PubSub:
         called by the # connection to resubscribe us to any channels and
         patterns we were previously listening to
         """
-        return await conn.retry.call_with_retry(
-            lambda: command(*args, **kwargs),
-            lambda error: self._disconnect_raise_connect(conn, error),
+        return await asyncio.shield(
+            conn.retry.call_with_retry(
+                lambda: self._try_execute(conn, command, *args, **kwargs),
+                lambda error: self._disconnect_raise_connect(conn, error),
+            )
         )
 
     async def parse_response(self, block: bool = True, timeout: float = 0):
@@ -754,9 +812,11 @@ class PubSub:
 
         await self.check_health()
 
-        if not block and not await self._execute(conn, conn.can_read, timeout=timeout):
-            return None
-        response = await self._execute(conn, conn.read_response)
+        if not conn.is_connected:
+            await conn.connect()
+
+        read_timeout = None if block else timeout
+        response = await self._execute(conn, conn.read_response, timeout=read_timeout)
 
         if conn.health_check_interval and response == self.health_check_response:
             # ignore the health check message as user might not expect it
@@ -773,7 +833,7 @@ class PubSub:
 
         if (
             conn.health_check_interval
-            and asyncio.get_event_loop().time() > conn.next_health_check
+            and asyncio.get_running_loop().time() > conn.next_health_check
         ):
             await conn.send_command(
                 "PING", self.HEALTH_CHECK_MESSAGE, check_health=False
@@ -868,16 +928,16 @@ class PubSub:
                 yield response
 
     async def get_message(
-        self, ignore_subscribe_messages: bool = False, timeout: float = 0.0
+        self, ignore_subscribe_messages: bool = False, timeout: Optional[float] = 0.0
     ):
         """
         Get the next message if one is available, otherwise None.
 
         If timeout is specified, the system will wait for `timeout` seconds
         before returning. Timeout should be specified as a floating point
-        number.
+        number or None to wait indefinitely.
         """
-        response = await self.parse_response(block=False, timeout=timeout)
+        response = await self.parse_response(block=(timeout is None), timeout=timeout)
         if response:
             return await self.handle_message(response, ignore_subscribe_messages)
         return None
@@ -1107,7 +1167,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             raise RedisError("Cannot issue nested calls to MULTI")
         if self.command_stack:
             raise RedisError(
-                "Commands without an initial WATCH have already " "been issued"
+                "Commands without an initial WATCH have already been issued"
             )
         self.explicit_transaction = True
 
@@ -1132,12 +1192,24 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         if self.watching:
             await self.reset()
             raise WatchError(
-                "A ConnectionError occurred on while " "watching one or more keys"
+                "A ConnectionError occurred on while watching one or more keys"
             )
         # if retry_on_timeout is not set, or the error is not
         # a TimeoutError, raise it
         if not (conn.retry_on_timeout and isinstance(error, TimeoutError)):
             await self.reset()
+            raise
+
+    async def _try_send_command_parse_response(self, conn, *args, **options):
+        try:
+            return await conn.retry.call_with_retry(
+                lambda: self._send_command_parse_response(
+                    conn, args[0], *args, **options
+                ),
+                lambda error: self._disconnect_reset_raise(conn, error),
+            )
+        except asyncio.CancelledError:
+            await conn.disconnect()
             raise
 
     async def immediate_execute_command(self, *args, **options):
@@ -1155,12 +1227,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 command_name, self.shard_hint
             )
             self.connection = conn
-
-        return await conn.retry.call_with_retry(
-            lambda: self._send_command_parse_response(
-                conn, command_name, *args, **options
-            ),
-            lambda error: self._disconnect_reset_raise(conn, error),
+        return await asyncio.shield(
+            self._try_send_command_parse_response(conn, *args, **options)
         )
 
     def pipeline_execute_command(self, *args, **options):
@@ -1320,13 +1388,26 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         # indicates the user should retry this transaction.
         if self.watching:
             raise WatchError(
-                "A ConnectionError occurred on while " "watching one or more keys"
+                "A ConnectionError occurred on while watching one or more keys"
             )
         # if retry_on_timeout is not set, or the error is not
         # a TimeoutError, raise it
         if not (conn.retry_on_timeout and isinstance(error, TimeoutError)):
             await self.reset()
             raise
+
+    async def _try_execute(self, conn, execute, stack, raise_on_error):
+        try:
+            return await conn.retry.call_with_retry(
+                lambda: execute(conn, stack, raise_on_error),
+                lambda error: self._disconnect_raise_reset(conn, error),
+            )
+        except asyncio.CancelledError:
+            # not supposed to be possible, yet here we are
+            await conn.disconnect(nowait=True)
+            raise
+        finally:
+            await self.reset()
 
     async def execute(self, raise_on_error: bool = True):
         """Execute all the commands in the current pipeline"""
@@ -1349,10 +1430,11 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         conn = cast(Connection, conn)
 
         try:
-            return await conn.retry.call_with_retry(
-                lambda: execute(conn, stack, raise_on_error),
-                lambda error: self._disconnect_raise_reset(conn, error),
+            return await asyncio.shield(
+                self._try_execute(conn, execute, stack, raise_on_error)
             )
+        except RuntimeError:
+            await self.reset()
         finally:
             await self.reset()
 

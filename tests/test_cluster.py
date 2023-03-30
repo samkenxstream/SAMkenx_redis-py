@@ -1,12 +1,14 @@
 import binascii
 import datetime
 import warnings
+from queue import LifoQueue, Queue
 from time import sleep
 from unittest.mock import DEFAULT, Mock, call, patch
 
 import pytest
 
 from redis import Redis
+from redis.backoff import ExponentialBackoff, NoBackoff, default_backoff
 from redis.cluster import (
     PRIMARY,
     REDIS_CLUSTER_HASH_SLOTS,
@@ -17,7 +19,7 @@ from redis.cluster import (
     get_node_name,
 )
 from redis.commands import CommandsParser
-from redis.connection import Connection
+from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
 from redis.crc import key_slot
 from redis.exceptions import (
     AskError,
@@ -31,6 +33,7 @@ from redis.exceptions import (
     ResponseError,
     TimeoutError,
 )
+from redis.retry import Retry
 from redis.utils import str_if_bytes
 from tests.test_pubsub import wait_for_message
 
@@ -174,7 +177,7 @@ def moved_redirection_helper(request, failover=False):
     prev_primary = rc.nodes_manager.get_node_from_slot(slot)
     if failover:
         if len(rc.nodes_manager.slots_cache[slot]) < 2:
-            warnings.warn("Skipping this test since it requires to have a " "replica")
+            warnings.warn("Skipping this test since it requires to have a replica")
             return
         redirect_node = rc.nodes_manager.slots_cache[slot][1]
     else:
@@ -242,7 +245,7 @@ class TestRedisClusterObj:
             RedisCluster(startup_nodes=[])
 
         assert str(ex.value).startswith(
-            "RedisCluster requires at least one node to discover the " "cluster"
+            "RedisCluster requires at least one node to discover the cluster"
         ), str_if_bytes(ex.value)
 
     def test_from_url(self, r):
@@ -263,7 +266,7 @@ class TestRedisClusterObj:
         with pytest.raises(RedisClusterException) as ex:
             r.execute_command("GET")
         assert str(ex.value).startswith(
-            "No way to dispatch this command to " "Redis Cluster. Missing key."
+            "No way to dispatch this command to Redis Cluster. Missing key."
         )
 
     def test_execute_command_node_flag_primaries(self, r):
@@ -357,6 +360,60 @@ class TestRedisClusterObj:
             parse_response.side_effect = ask_redirect_effect
 
             assert r.execute_command("SET", "foo", "bar") == "MOCK_OK"
+
+    def test_handling_cluster_failover_to_a_replica(self, r):
+        # Set the key we'll test for
+        key = "key"
+        r.set("key", "value")
+        primary = r.get_node_from_key(key, replica=False)
+        assert str_if_bytes(r.get("key")) == "value"
+        # Get the current output of cluster slots
+        cluster_slots = primary.redis_connection.execute_command("CLUSTER SLOTS")
+        replica_host = ""
+        replica_port = 0
+        # Replace one of the replicas to be the new primary based on the
+        # cluster slots output
+        for slot_range in cluster_slots:
+            primary_port = slot_range[2][1]
+            if primary_port == primary.port:
+                if len(slot_range) <= 3:
+                    # cluster doesn't have a replica, return
+                    return
+                replica_host = str_if_bytes(slot_range[3][0])
+                replica_port = slot_range[3][1]
+                # replace replica and primary in the cluster slots output
+                tmp_node = slot_range[2]
+                slot_range[2] = slot_range[3]
+                slot_range[3] = tmp_node
+                break
+
+        def raise_connection_error():
+            raise ConnectionError("error")
+
+        def mock_execute_command(*_args, **_kwargs):
+            if _args[0] == "CLUSTER SLOTS":
+                return cluster_slots
+            else:
+                raise Exception("Failed to mock cluster slots")
+
+        # Mock connection error for the current primary
+        mock_node_resp_func(primary, raise_connection_error)
+        primary.redis_connection.set_retry(Retry(NoBackoff(), 1))
+
+        # Mock the cluster slots response for all other nodes
+        redis_mock_node = Mock()
+        redis_mock_node.execute_command.side_effect = mock_execute_command
+        # Mock response value for all other commands
+        redis_mock_node.parse_response.return_value = "MOCK_OK"
+        for node in r.get_nodes():
+            if node.port != primary.port:
+                node.redis_connection = redis_mock_node
+
+        assert r.get(key) == "MOCK_OK"
+        new_primary = r.get_node_from_key(key, replica=False)
+        assert new_primary.host == replica_host
+        assert new_primary.port == replica_port
+        assert r.get_node(primary.host, primary.port).server_type == REPLICA
 
     def test_moved_redirection(self, request):
         """
@@ -505,7 +562,15 @@ class TestRedisClusterObj:
                 read_cluster.get("foo")
                 read_cluster.get("foo")
                 read_cluster.get("foo")
-                mocks["send_command"].assert_has_calls([call("READONLY")])
+                mocks["send_command"].assert_has_calls(
+                    [
+                        call("READONLY"),
+                        call("GET", "foo"),
+                        call("READONLY"),
+                        call("GET", "foo"),
+                        call("GET", "foo"),
+                    ]
+                )
 
     def test_keyslot(self, r):
         """
@@ -672,7 +737,7 @@ class TestRedisClusterObj:
         with patch.object(Redis, "parse_response") as parse_response:
 
             def moved_redirect_effect(connection, *args, **options):
-                # raise a timeout for 5 times so we'll need to reinitilize the topology
+                # raise a timeout for 5 times so we'll need to reinitialize the topology
                 if count.val == 4:
                     parse_response.side_effect = real_func
                 count.val += 1
@@ -690,6 +755,73 @@ class TestRedisClusterObj:
                     # topology refresh
                     cur_node = r.get_node(node_name=node_name)
                     assert conn == r.get_redis_connection(cur_node)
+
+    def test_cluster_get_set_retry_object(self, request):
+        retry = Retry(NoBackoff(), 2)
+        r = _get_client(RedisCluster, request, retry=retry)
+        assert r.get_retry()._retries == retry._retries
+        assert isinstance(r.get_retry()._backoff, NoBackoff)
+        for node in r.get_nodes():
+            assert node.redis_connection.get_retry()._retries == retry._retries
+            assert isinstance(node.redis_connection.get_retry()._backoff, NoBackoff)
+        rand_node = r.get_random_node()
+        existing_conn = rand_node.redis_connection.connection_pool.get_connection("_")
+        # Change retry policy
+        new_retry = Retry(ExponentialBackoff(), 3)
+        r.set_retry(new_retry)
+        assert r.get_retry()._retries == new_retry._retries
+        assert isinstance(r.get_retry()._backoff, ExponentialBackoff)
+        for node in r.get_nodes():
+            assert node.redis_connection.get_retry()._retries == new_retry._retries
+            assert isinstance(
+                node.redis_connection.get_retry()._backoff, ExponentialBackoff
+            )
+        assert existing_conn.retry._retries == new_retry._retries
+        new_conn = rand_node.redis_connection.connection_pool.get_connection("_")
+        assert new_conn.retry._retries == new_retry._retries
+
+    def test_cluster_retry_object(self, r) -> None:
+        # Test default retry
+        retry = r.get_connection_kwargs().get("retry")
+        assert isinstance(retry, Retry)
+        assert retry._retries == 0
+        assert isinstance(retry._backoff, type(default_backoff()))
+        node1 = r.get_node("127.0.0.1", 16379).redis_connection
+        node2 = r.get_node("127.0.0.1", 16380).redis_connection
+        assert node1.get_retry()._retries == node2.get_retry()._retries
+
+        # Test custom retry
+        retry = Retry(ExponentialBackoff(10, 5), 5)
+        rc_custom_retry = RedisCluster("127.0.0.1", 16379, retry=retry)
+        assert (
+            rc_custom_retry.get_node("127.0.0.1", 16379)
+            .redis_connection.get_retry()
+            ._retries
+            == retry._retries
+        )
+
+    def test_replace_cluster_node(self, r) -> None:
+        prev_default_node = r.get_default_node()
+        r.replace_default_node()
+        assert r.get_default_node() != prev_default_node
+        r.replace_default_node(prev_default_node)
+        assert r.get_default_node() == prev_default_node
+
+    def test_default_node_is_replaced_after_exception(self, r):
+        curr_default_node = r.get_default_node()
+        # CLUSTER NODES command is being executed on the default node
+        nodes = r.cluster_nodes()
+        assert "myself" in nodes.get(curr_default_node.name).get("flags")
+
+        def raise_connection_error():
+            raise ConnectionError("error")
+
+        # Mock connection error for the default node
+        mock_node_resp_func(curr_default_node, raise_connection_error)
+        # Test that the command succeed from a different node
+        nodes = r.cluster_nodes()
+        assert "myself" not in nodes.get(curr_default_node.name).get("flags")
+        assert r.get_default_node() != curr_default_node
 
 
 @pytest.mark.onlycluster
@@ -1165,6 +1297,14 @@ class TestClusterRedisCommands:
         assert links_to == links_for
         for i in range(0, len(res) - 1, 2):
             assert res[i][3] == res[i + 1][3]
+
+    def test_cluster_flshslots_not_implemented(self, r):
+        with pytest.raises(NotImplementedError):
+            r.cluster_flushslots()
+
+    def test_cluster_bumpepoch_not_implemented(self, r):
+        with pytest.raises(NotImplementedError):
+            r.cluster_bumpepoch()
 
     @skip_if_redis_enterprise()
     def test_readonly(self):
@@ -2123,6 +2263,57 @@ class TestNodesManager:
 
         assert len(n_manager.nodes_cache) == 6
 
+    def test_init_promote_server_type_for_node_in_cache(self):
+        """
+        When replica is promoted to master, nodes_cache must change the server type
+        accordingly
+        """
+        cluster_slots_before_promotion = [
+            [0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]
+        ]
+        cluster_slots_after_promotion = [
+            [0, 16383, ["127.0.0.1", 7003], ["127.0.0.1", 7004]]
+        ]
+
+        cluster_slots_results = [
+            cluster_slots_before_promotion,
+            cluster_slots_after_promotion,
+        ]
+
+        with patch.object(Redis, "execute_command") as execute_command_mock:
+
+            def execute_command(*_args, **_kwargs):
+                if _args[0] == "CLUSTER SLOTS":
+                    mock_cluster_slots = cluster_slots_results.pop(0)
+                    return mock_cluster_slots
+                elif _args[0] == "COMMAND":
+                    return {"get": [], "set": []}
+                elif _args[0] == "INFO":
+                    return {"cluster_enabled": True}
+                elif len(_args) > 1 and _args[1] == "cluster-require-full-coverage":
+                    return {"cluster-require-full-coverage": False}
+                else:
+                    return execute_command_mock(*_args, **_kwargs)
+
+            execute_command_mock.side_effect = execute_command
+
+            nm = NodesManager(
+                startup_nodes=[ClusterNode(host=default_host, port=default_port)],
+                from_url=False,
+                require_full_coverage=False,
+                dynamic_startup_nodes=True,
+            )
+
+            assert nm.default_node.host == "127.0.0.1"
+            assert nm.default_node.port == 7000
+            assert nm.default_node.server_type == PRIMARY
+
+            nm.initialize()
+
+            assert nm.default_node.host == "127.0.0.1"
+            assert nm.default_node.port == 7003
+            assert nm.default_node.server_type == PRIMARY
+
     def test_init_slots_cache_cluster_mode_disabled(self):
         """
         Test that creating a RedisCluster failes if one of the startup nodes
@@ -2305,6 +2496,33 @@ class TestNodesManager:
             assert startup_nodes.sort() == discovered_nodes.sort()
         else:
             assert startup_nodes == ["my@DNS.com:7000"]
+
+    @pytest.mark.parametrize(
+        "connection_pool_class", [ConnectionPool, BlockingConnectionPool]
+    )
+    def test_connection_pool_class(self, connection_pool_class):
+        rc = get_mocked_redis_client(
+            url="redis://my@DNS.com:7000",
+            cluster_slots=default_cluster_slots,
+            connection_pool_class=connection_pool_class,
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            assert isinstance(
+                node.redis_connection.connection_pool, connection_pool_class
+            )
+
+    @pytest.mark.parametrize("queue_class", [Queue, LifoQueue])
+    def test_allow_custom_queue_class(self, queue_class):
+        rc = get_mocked_redis_client(
+            url="redis://my@DNS.com:7000",
+            cluster_slots=default_cluster_slots,
+            connection_pool_class=BlockingConnectionPool,
+            queue_class=queue_class,
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            assert node.redis_connection.connection_pool.queue_class == queue_class
 
 
 @pytest.mark.onlycluster
@@ -2498,6 +2716,25 @@ class TestClusterPipeline:
             with pytest.raises(RedisClusterException):
                 pipe.delete("a", "b")
 
+    def test_unlink_single(self, r):
+        """
+        Test a single unlink operation
+        """
+        r["a"] = 1
+        with r.pipeline(transaction=False) as pipe:
+            pipe.unlink("a")
+            assert pipe.execute() == [1]
+
+    def test_multi_unlink_unsupported(self, r):
+        """
+        Test that multi unlink operation is unsupported
+        """
+        with r.pipeline(transaction=False) as pipe:
+            r["a"] = 1
+            r["b"] = 2
+            with pytest.raises(RedisClusterException):
+                pipe.unlink("a", "b")
+
     def test_brpoplpush_disabled(self, r):
         """
         Test that brpoplpush is disabled for ClusterPipeline
@@ -2666,7 +2903,7 @@ class TestClusterPipeline:
                 ask_node = node
                 break
         if ask_node is None:
-            warnings.warn("skipping this test since the cluster has only one " "node")
+            warnings.warn("skipping this test since the cluster has only one node")
             return
         ask_msg = f"{r.keyslot(key)} {ask_node.host}:{ask_node.port}"
 

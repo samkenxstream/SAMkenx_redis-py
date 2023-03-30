@@ -1,7 +1,24 @@
+from unittest.mock import patch
+
 import pytest
 
 from redis.commands.graph import Edge, Node, Path
 from redis.commands.graph.execution_plan import Operation
+from redis.commands.graph.query_result import (
+    CACHED_EXECUTION,
+    INDICES_CREATED,
+    INDICES_DELETED,
+    INTERNAL_EXECUTION_TIME,
+    LABELS_ADDED,
+    LABELS_REMOVED,
+    NODES_CREATED,
+    NODES_DELETED,
+    PROPERTIES_REMOVED,
+    PROPERTIES_SET,
+    RELATIONSHIPS_CREATED,
+    RELATIONSHIPS_DELETED,
+    QueryResult,
+)
 from redis.exceptions import ResponseError
 from tests.conftest import skip_if_redis_enterprise
 
@@ -107,7 +124,7 @@ def test_path(client):
 
 @pytest.mark.redismod
 def test_param(client):
-    params = [1, 2.3, "str", True, False, None, [0, 1, 2]]
+    params = [1, 2.3, "str", True, False, None, [0, 1, 2], r"\" RETURN 1337 //"]
     query = "RETURN $param"
     for param in params:
         result = client.graph().query(query, {"param": param})
@@ -263,7 +280,8 @@ def test_cached_execution(client):
 
 @pytest.mark.redismod
 def test_slowlog(client):
-    create_query = """CREATE (:Rider {name:'Valentino Rossi'})-[:rides]->(:Team {name:'Yamaha'}),
+    create_query = """CREATE (:Rider
+    {name:'Valentino Rossi'})-[:rides]->(:Team {name:'Yamaha'}),
     (:Rider {name:'Dani Pedrosa'})-[:rides]->(:Team {name:'Honda'}),
     (:Rider {name:'Andrea Dovizioso'})-[:rides]->(:Team {name:'Ducati'})"""
     client.graph().query(create_query)
@@ -349,11 +367,11 @@ def test_list_keys(client):
     result = client.graph().list_keys()
     assert result == []
 
-    client.execute_command("GRAPH.EXPLAIN", "G", "RETURN 1")
+    client.graph("G").query("CREATE (n)")
     result = client.graph().list_keys()
     assert result == ["G"]
 
-    client.execute_command("GRAPH.EXPLAIN", "X", "RETURN 1")
+    client.graph("X").query("CREATE (m)")
     result = client.graph().list_keys()
     assert result == ["G", "X"]
 
@@ -469,7 +487,8 @@ def test_cache_sync(client):
 @pytest.mark.redismod
 def test_execution_plan(client):
     redis_graph = client.graph("execution_plan")
-    create_query = """CREATE (:Rider {name:'Valentino Rossi'})-[:rides]->(:Team {name:'Yamaha'}),
+    create_query = """CREATE
+    (:Rider {name:'Valentino Rossi'})-[:rides]->(:Team {name:'Yamaha'}),
     (:Rider {name:'Dani Pedrosa'})-[:rides]->(:Team {name:'Honda'}),
     (:Rider {name:'Andrea Dovizioso'})-[:rides]->(:Team {name:'Ducati'})"""
     redis_graph.query(create_query)
@@ -478,7 +497,7 @@ def test_execution_plan(client):
         "MATCH (r:Rider)-[:rides]->(t:Team) WHERE t.name = $name RETURN r.name, t.name, $params",  # noqa
         {"name": "Yehuda"},
     )
-    expected = "Results\n    Project\n        Conditional Traverse | (t:Team)->(r:Rider)\n            Filter\n                Node By Label Scan | (t:Team)"  # noqa
+    expected = "Results\n    Project\n        Conditional Traverse | (t)->(r:Rider)\n            Filter\n                Node By Label Scan | (t:Team)"  # noqa
     assert result == expected
 
     redis_graph.delete()
@@ -509,11 +528,11 @@ Results
 Distinct
     Join
         Project
-            Conditional Traverse | (t:Team)->(r:Rider)
+            Conditional Traverse | (t)->(r:Rider)
                 Filter
                     Node By Label Scan | (t:Team)
         Project
-            Conditional Traverse | (t:Team)->(r:Rider)
+            Conditional Traverse | (t)->(r:Rider)
                 Filter
                     Node By Label Scan | (t:Team)"""
     assert str(result).replace(" ", "").replace("\n", "") == expected.replace(
@@ -525,9 +544,7 @@ Distinct
             Operation("Join")
             .append_child(
                 Operation("Project").append_child(
-                    Operation(
-                        "Conditional Traverse", "(t:Team)->(r:Rider)"
-                    ).append_child(
+                    Operation("Conditional Traverse", "(t)->(r:Rider)").append_child(
                         Operation("Filter").append_child(
                             Operation("Node By Label Scan", "(t:Team)")
                         )
@@ -536,9 +553,7 @@ Distinct
             )
             .append_child(
                 Operation("Project").append_child(
-                    Operation(
-                        "Conditional Traverse", "(t:Team)->(r:Rider)"
-                    ).append_child(
+                    Operation("Conditional Traverse", "(t)->(r:Rider)").append_child(
                         Operation("Filter").append_child(
                             Operation("Node By Label Scan", "(t:Team)")
                         )
@@ -575,3 +590,33 @@ Project
     assert result.structured_plan == expected
 
     redis_graph.delete()
+
+
+@pytest.mark.redismod
+def test_resultset_statistics(client):
+    with patch.object(target=QueryResult, attribute="_get_stat") as mock_get_stats:
+        result = client.graph().query("RETURN 1")
+        result.labels_added
+        mock_get_stats.assert_called_with(LABELS_ADDED)
+        result.labels_removed
+        mock_get_stats.assert_called_with(LABELS_REMOVED)
+        result.nodes_created
+        mock_get_stats.assert_called_with(NODES_CREATED)
+        result.nodes_deleted
+        mock_get_stats.assert_called_with(NODES_DELETED)
+        result.properties_set
+        mock_get_stats.assert_called_with(PROPERTIES_SET)
+        result.properties_removed
+        mock_get_stats.assert_called_with(PROPERTIES_REMOVED)
+        result.relationships_created
+        mock_get_stats.assert_called_with(RELATIONSHIPS_CREATED)
+        result.relationships_deleted
+        mock_get_stats.assert_called_with(RELATIONSHIPS_DELETED)
+        result.indices_created
+        mock_get_stats.assert_called_with(INDICES_CREATED)
+        result.indices_deleted
+        mock_get_stats.assert_called_with(INDICES_DELETED)
+        result.cached_execution
+        mock_get_stats.assert_called_with(CACHED_EXECUTION)
+        result.run_time_ms
+        mock_get_stats.assert_called_with(INTERNAL_EXECUTION_TIME)

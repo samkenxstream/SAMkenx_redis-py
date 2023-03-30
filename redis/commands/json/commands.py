@@ -2,9 +2,8 @@ import os
 from json import JSONDecodeError, loads
 from typing import Dict, List, Optional, Union
 
-from deprecated import deprecated
-
 from redis.exceptions import DataError
+from redis.utils import deprecated_function
 
 from ._util import JsonType
 from .decoders import decode_dict_keys
@@ -32,8 +31,8 @@ class JSONCommands:
         name: str,
         path: str,
         scalar: int,
-        start: Optional[int] = 0,
-        stop: Optional[int] = -1,
+        start: Optional[int] = None,
+        stop: Optional[int] = None,
     ) -> List[Union[int, None]]:
         """
         Return the index of ``scalar`` in the JSON array under ``path`` at key
@@ -44,9 +43,13 @@ class JSONCommands:
 
         For more information see `JSON.ARRINDEX <https://redis.io/commands/json.arrindex>`_.
         """  # noqa
-        return self.execute_command(
-            "JSON.ARRINDEX", name, str(path), self._encode(scalar), start, stop
-        )
+        pieces = [name, str(path), self._encode(scalar)]
+        if start is not None:
+            pieces.append(start)
+            if stop is not None:
+                pieces.append(stop)
+
+        return self.execute_command("JSON.ARRINDEX", *pieces)
 
     def arrinsert(
         self, name: str, path: str, index: int, *args: List[JsonType]
@@ -137,7 +140,7 @@ class JSONCommands:
             "JSON.NUMINCRBY", name, str(path), self._encode(number)
         )
 
-    @deprecated(version="4.0.0", reason="deprecated since redisjson 1.0.0")
+    @deprecated_function(version="4.0.0", reason="deprecated since redisjson 1.0.0")
     def nummultby(self, name: str, path: str, number: int) -> str:
         """Multiply the numeric (integer or floating point) JSON value under
         ``path`` at key ``name`` with the provided ``number``.
@@ -368,19 +371,19 @@ class JSONCommands:
             pieces.append(str(path))
         return self.execute_command("JSON.DEBUG", *pieces)
 
-    @deprecated(
+    @deprecated_function(
         version="4.0.0", reason="redisjson-py supported this, call get directly."
     )
     def jsonget(self, *args, **kwargs):
         return self.get(*args, **kwargs)
 
-    @deprecated(
+    @deprecated_function(
         version="4.0.0", reason="redisjson-py supported this, call get directly."
     )
     def jsonmget(self, *args, **kwargs):
         return self.mget(*args, **kwargs)
 
-    @deprecated(
+    @deprecated_function(
         version="4.0.0", reason="redisjson-py supported this, call get directly."
     )
     def jsonset(self, *args, **kwargs):

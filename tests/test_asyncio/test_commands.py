@@ -4,20 +4,14 @@ Tests async overrides of commands from their mixins
 import binascii
 import datetime
 import re
-import sys
-import time
 from string import ascii_letters
 
 import pytest
-
-if sys.version_info[0:2] == (3, 6):
-    import pytest as pytest_asyncio
-else:
-    import pytest_asyncio
+import pytest_asyncio
 
 import redis
 from redis import exceptions
-from redis.client import parse_info
+from redis.client import EMPTY_RESPONSE, NEVER_DECODE, parse_info
 from tests.conftest import (
     skip_if_server_version_gte,
     skip_if_server_version_lt,
@@ -27,11 +21,24 @@ from tests.conftest import (
 REDIS_6_VERSION = "5.9.0"
 
 
-pytestmark = pytest.mark.asyncio
+@pytest_asyncio.fixture()
+async def r_teardown(r: redis.Redis):
+    """
+    A special fixture which removes the provided names from the database after use
+    """
+    usernames = []
+
+    def factory(username):
+        usernames.append(username)
+        return r
+
+    yield factory
+    for username in usernames:
+        await r.acl_deluser(username)
 
 
 @pytest_asyncio.fixture()
-async def slowlog(r: redis.Redis, event_loop):
+async def slowlog(r: redis.Redis):
     current_config = await r.config_get()
     old_slower_than_value = current_config["slowlog-log-slower-than"]
     old_max_legnth_value = current_config["slowlog-max-len"]
@@ -94,17 +101,9 @@ class TestRedisCommands:
         assert "get" in commands
 
     @skip_if_server_version_lt(REDIS_6_VERSION)
-    async def test_acl_deluser(self, r: redis.Redis, request, event_loop):
+    async def test_acl_deluser(self, r_teardown):
         username = "redis-py-user"
-
-        def teardown():
-            coro = r.acl_deluser(username)
-            if event_loop.is_running():
-                event_loop.create_task(coro)
-            else:
-                event_loop.run_until_complete(coro)
-
-        request.addfinalizer(teardown)
+        r = r_teardown(username)
 
         assert await r.acl_deluser(username) == 0
         assert await r.acl_setuser(username, enabled=False, reset=True)
@@ -117,18 +116,9 @@ class TestRedisCommands:
 
     @skip_if_server_version_lt(REDIS_6_VERSION)
     @skip_if_server_version_gte("7.0.0")
-    async def test_acl_getuser_setuser(self, r: redis.Redis, request, event_loop):
+    async def test_acl_getuser_setuser(self, r_teardown):
         username = "redis-py-user"
-
-        def teardown():
-            coro = r.acl_deluser(username)
-            if event_loop.is_running():
-                event_loop.create_task(coro)
-            else:
-                event_loop.run_until_complete(coro)
-
-        request.addfinalizer(teardown)
-
+        r = r_teardown(username)
         # test enabled=False
         assert await r.acl_setuser(username, enabled=False, reset=True)
         assert await r.acl_getuser(username) == {
@@ -209,7 +199,7 @@ class TestRedisCommands:
 
         # Resets and tests that hashed passwords are set properly.
         hashed_password = (
-            "5e884898da28047151d0e56f8dc629" "2773603d0d6aabbdd62a11ef721d1542d8"
+            "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
         )
         assert await r.acl_setuser(
             username, enabled=True, reset=True, hashed_passwords=["+" + hashed_password]
@@ -233,17 +223,9 @@ class TestRedisCommands:
 
     @skip_if_server_version_lt(REDIS_6_VERSION)
     @skip_if_server_version_gte("7.0.0")
-    async def test_acl_list(self, r: redis.Redis, request, event_loop):
+    async def test_acl_list(self, r_teardown):
         username = "redis-py-user"
-
-        def teardown():
-            coro = r.acl_deluser(username)
-            if event_loop.is_running():
-                event_loop.create_task(coro)
-            else:
-                event_loop.run_until_complete(coro)
-
-        request.addfinalizer(teardown)
+        r = r_teardown(username)
 
         assert await r.acl_setuser(username, enabled=False, reset=True)
         users = await r.acl_list()
@@ -251,17 +233,9 @@ class TestRedisCommands:
 
     @skip_if_server_version_lt(REDIS_6_VERSION)
     @pytest.mark.onlynoncluster
-    async def test_acl_log(self, r: redis.Redis, request, event_loop, create_redis):
+    async def test_acl_log(self, r_teardown, create_redis):
         username = "redis-py-user"
-
-        def teardown():
-            coro = r.acl_deluser(username)
-            if event_loop.is_running():
-                event_loop.create_task(coro)
-            else:
-                event_loop.run_until_complete(coro)
-
-        request.addfinalizer(teardown)
+        r = r_teardown(username)
         await r.acl_setuser(
             username,
             enabled=True,
@@ -294,55 +268,25 @@ class TestRedisCommands:
         assert await r.acl_log_reset()
 
     @skip_if_server_version_lt(REDIS_6_VERSION)
-    async def test_acl_setuser_categories_without_prefix_fails(
-        self, r: redis.Redis, request, event_loop
-    ):
+    async def test_acl_setuser_categories_without_prefix_fails(self, r_teardown):
         username = "redis-py-user"
-
-        def teardown():
-            coro = r.acl_deluser(username)
-            if event_loop.is_running():
-                event_loop.create_task(coro)
-            else:
-                event_loop.run_until_complete(coro)
-
-        request.addfinalizer(teardown)
+        r = r_teardown(username)
 
         with pytest.raises(exceptions.DataError):
             await r.acl_setuser(username, categories=["list"])
 
     @skip_if_server_version_lt(REDIS_6_VERSION)
-    async def test_acl_setuser_commands_without_prefix_fails(
-        self, r: redis.Redis, request, event_loop
-    ):
+    async def test_acl_setuser_commands_without_prefix_fails(self, r_teardown):
         username = "redis-py-user"
-
-        def teardown():
-            coro = r.acl_deluser(username)
-            if event_loop.is_running():
-                event_loop.create_task(coro)
-            else:
-                event_loop.run_until_complete(coro)
-
-        request.addfinalizer(teardown)
+        r = r_teardown(username)
 
         with pytest.raises(exceptions.DataError):
             await r.acl_setuser(username, commands=["get"])
 
     @skip_if_server_version_lt(REDIS_6_VERSION)
-    async def test_acl_setuser_add_passwords_and_nopass_fails(
-        self, r: redis.Redis, request, event_loop
-    ):
+    async def test_acl_setuser_add_passwords_and_nopass_fails(self, r_teardown):
         username = "redis-py-user"
-
-        def teardown():
-            coro = r.acl_deluser(username)
-            if event_loop.is_running():
-                event_loop.create_task(coro)
-            else:
-                event_loop.run_until_complete(coro)
-
-        request.addfinalizer(teardown)
+        r = r_teardown(username)
 
         with pytest.raises(exceptions.DataError):
             await r.acl_setuser(username, passwords="+mypass", nopass=True)
@@ -598,6 +542,16 @@ class TestRedisCommands:
         assert isinstance(t[0], int)
         assert isinstance(t[1], int)
 
+    async def test_never_decode_option(self, r: redis.Redis):
+        opts = {NEVER_DECODE: []}
+        await r.delete("a")
+        assert await r.execute_command("EXISTS", "a", **opts) == 0
+
+    async def test_empty_response_option(self, r: redis.Redis):
+        opts = {EMPTY_RESPONSE: []}
+        await r.delete("a")
+        assert await r.execute_command("EXISTS", "a", **opts) == 0
+
     # BASIC KEY COMMANDS
     async def test_append(self, r: redis.Redis):
         assert await r.append("a", "a1") == 2
@@ -805,7 +759,7 @@ class TestRedisCommands:
     async def test_expireat_unixtime(self, r: redis.Redis):
         expire_at = await redis_server_time(r) + datetime.timedelta(minutes=1)
         await r.set("a", "foo")
-        expire_at_seconds = int(time.mktime(expire_at.timetuple()))
+        expire_at_seconds = int(expire_at.timestamp())
         assert await r.expireat("a", expire_at_seconds)
         assert 0 < await r.ttl("a") <= 61
 
@@ -930,8 +884,8 @@ class TestRedisCommands:
     async def test_pexpireat_unixtime(self, r: redis.Redis):
         expire_at = await redis_server_time(r) + datetime.timedelta(minutes=1)
         await r.set("a", "foo")
-        expire_at_seconds = int(time.mktime(expire_at.timetuple())) * 1000
-        assert await r.pexpireat("a", expire_at_seconds)
+        expire_at_milliseconds = int(expire_at.timestamp() * 1000)
+        assert await r.pexpireat("a", expire_at_milliseconds)
         assert 0 < await r.pttl("a") <= 61000
 
     @skip_if_server_version_lt("2.6.0")
@@ -3009,6 +2963,19 @@ class TestRedisCommands:
         )
         assert resp == [0, None, 255]
 
+    @skip_if_server_version_lt("6.0.0")
+    async def test_bitfield_ro(self, r: redis.Redis):
+        bf = r.bitfield("a")
+        resp = await bf.set("u8", 8, 255).execute()
+        assert resp == [0]
+
+        resp = await r.bitfield_ro("a", "u8", 0)
+        assert resp == [0]
+
+        items = [("u4", 8), ("u4", 12), ("u4", 13)]
+        resp = await r.bitfield_ro("a", "u8", 0, items)
+        assert resp == [0, 15, 15, 14]
+
     @skip_if_server_version_lt("4.0.0")
     async def test_memory_stats(self, r: redis.Redis):
         # put a key into the current db to make sure that "db.<current-db>"
@@ -3029,7 +2996,8 @@ class TestRedisCommands:
     @pytest.mark.onlynoncluster
     async def test_module_list(self, r: redis.Redis):
         assert isinstance(await r.module_list(), list)
-        assert not await r.module_list()
+        for x in await r.module_list():
+            assert isinstance(x, dict)
 
 
 @pytest.mark.onlynoncluster
